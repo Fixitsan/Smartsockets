@@ -1,0 +1,1765 @@
+; Source code for B-7971 'Smart Sockets' by Chris Barron,June/July 2006
+
+
+; * NON-CASE SENSITIVE *
+
+;Last Updated :- 28th August, 2007
+;    -Changed textfont 'R' Structure, to include horizontal centre bar
+;   - added  effect 'zipper' in effect 5, replacing 'sweller-jump'    
+
+;The code is laid out in the way it was written and so it probably doesn't
+;appear to have an obvious structure. It could probably benefit from
+;further optimisation but the speed of operation is close to what is achievable
+; already.
+
+;The  order of operation is as follows.........
+
+;Run through loop 'TOP' in procedure 'MAIN' testing the relevant bits of the
+;Control register to see if they're set.
+;Control bit 7, 'Control.7', is set when a change of display output is required
+;Control bit 1 is set when a good data packet has been received and validated
+;Usually, control bit 7 is set from within the procedure which is run as a result
+;of Bit 1 being set, but not always.
+
+;Serial data is handled in the interupt. A received byte sets the interupt flag
+;and immediately after receiving it it is retransmitted to the next element
+;in the chain. The byte is then tested for validity. The receipt of character 13
+; <ENTER> causes the program to branch, while in the interupt, to establish
+;what type of message has been received and wether or not it is intended for
+;this element. For example, the recipt of an exclamation mark means that
+;this element can ignore the data.
+
+;The IC's communicate with one another in simplex format at powerup to allow
+;each element to determine it's own position within a chain of devices.
+;The most important device is device number 1. Device number 1 enumerates
+;itself with number one and then passes it's number to the next element 
+; in the chain. The next element increments the numbver it received and
+;assigns itself to the new number...and so on upto 255 elements.
+;The way the first element determines that it is in fact the first element
+;is by it looking in the serial USART receive buffer at powerup, and if it
+;does NOT contain '171' it is the first element.
+
+;At powerup all devices clear their input buffer, pause briefly, and then 
+;transmit '171' to the next device in the chain. Therefore all elements
+;will have 171 in their receive buffer with the exception of the first
+;device.
+
+;I toyed with an automatic baud rate detection routine to enable the 
+;microcontrollers to synch themselves to the incoming data rate, but found
+;that 9600 is standard enough, and with a little tweaking a value used
+;for setting the baud rate generator's clock rate seems to work well
+;for all the varying speeds that the pics internal oscillators work at
+;when you compare one device with another. I've found a setting which
+;seems to work for all the pic16F690's I've tried, which have varying
+;speeds of operation when using the onboard oscillator at 4MHz. If you
+;have the misfortune of finding a device which doesn't synch to 9600 baud
+;it is  a simple matter to change the baud rate setting for just that
+;one device.
+
+; All feedback would be gratefully received, to fixitsan@aol.com
+
+@   DEVICE PIC16F690, CPD_OFF,WDT_OFF,PWRT_OFF,BOD_OFF,INTRC_OSC_NOCLKOUT,MCLR_OFF
+'@device pic16f690
+;= = = = = = = = = = = = = = = 
+;= = = START OF PROGRAM = = = =  
+;= = = = = = = = = = = = = = = 
+
+
+; EEPROM  CODE FOR UDCs
+eeprom 116,[1,16, 96,0, 0,160, 16,68, 2,8, 196,80, 248,20, 0,68, 1,84, 0,40, 2,128]
+eeprom 138,[3,128,  1,192, 0,224, 0,112, 0,56, 0,28, 2,12, 3,4]
+
+; eeprom code for base settings
+eeprom 253,[0,1,3]  ; font,effect, speed
+
+
+ 
+; = = = = = = = = = = = = LIBRARY FILES TO BE INCLUDED = = = = = = = = = = =
+        Include "modedefs.bas"          '
+;        INCLUDE "16F690"
+; = = = = = = = = = = = = = VARIABLE DECLARATION = = = = = = = = = = = = = 
+       
+define INTHAND myint ; Assembly language interrupt handler
+; Note when using the assembly inerupt in this instance that PBasic
+; saves the values of the W-Reg and associated registers automatically
+define  OSC 4 ; 4MHz oscillator                                           
+
+ ; +*++*+*+*+*  USER VARIABLES   *+*+*+*++*+*
+;In accordance with the manual, three wsave locations are reserved as 
+;system reg's
+
+wsave var byte $20 system
+wsave1 var byte $a0 system ; If device has RAM in bank1
+wsave2 var byte $120 system ; If device has RAM in bank2
+psave   VAR     BYTE    bank0   system
+ssave var byte bank0 system
+
+
+
+;Program variables   
+PORTC_BUF   VAR BYTE ; contents of portC save register    
+RX_BYTE_CNT Var Byte ; count of the number of data bytes received
+RX_BUF Var BYTE      ; buffer for the received byte
+BYTE_CNT VAR BYTE    ; 'bytes processed' counter
+DUMMY   VAR byte     ; GP register
+DEVICE VAR BYTE      ; The enumerated value of this device, position in the chain
+OUTVAL  VAR BYTE     ; Used to transfer data back from lookup tables
+TYPE VAR BYTE        ; Used to record message type, numeric
+SPARE VAR BYTE       ; Spare !
+LOOP VAR BYTE        ; A Loop counter
+FONT VAR byte        ; Current font in use
+EFFECT var byte      ; Current effect in use
+OUTA2H Var Byte      ; B7971 segment outputs A to H.
+OUTI2N var byte      ; B7971 segment outputs I to N
+OLD_PORTC var byte   ; Last status of portC, used to restore it's settings
+OLD_PORTB var byte   ; As above , especially used in crossfading
+OLD_PORTA var byte   ; As above
+NEW_PORTA var byte   ; The new intended setting of PORT A
+NEW_PORTB var byte   ; As above, used in crossfading between two values
+NEW_PORTC var byte   ; As Above, in conjunction with the 'OLD_' values
+GP3 var byte         ; General purpose register
+ESPEED var byte      ; Speed of effects. Each effect has a different
+                     ; runtime duration, so Espeed is used to calibrate them
+GP var byte
+GP2 var byte
+GP4 var byte
+
+BESPEED var byte    ; Effect speed Used specifically when one of the displays is Blank
+EE_ADR var byte     ; EEPROM STUFF
+EE_DAT var byte
+TEMP1   var byte    ; Another Temp register
+OUTBIT  var bit    
+INT_SPARE VAR BYTE
+PROGRESS var byte
+RX_BUFFER Var Byte [17]
+ticks_reload var byte ; used to time the display events
+control var Byte
+ticks var byte        ; used to time the display events
+ZFLAGS var byte
+
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTC,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character
+
+sega    var PORTA.1
+segb    VAR PORTC.0
+segc    VAR PORTA.2
+segd    var PORTA.5
+sege    var PORTC.6
+segf    var PORTC.3
+segg    var PORTC.4
+segh    var PORTB.6
+segi    var PORTC.1
+segj    var PORTA.0
+segk    var PORTC.2
+segl    var PORTC.5
+segm    var PORTC.7
+segn    VAR PORTA.4
+segu    var PORTB.4
+
+
+
+
+z
+flags = 0
+
+goto init  ; = = = = = JUMP TO BEGINNING OF RUN CODE = = = = = = = 
+
+
+SPIRALPAUSE: ; An effect pause unique to effects 7,8,and 9
+; Each one has it's own delay because each has a different duration
+    if effect = 7 then PAUSE   (ESPEED+1) * 22
+    if effect = 8 then pause    (espeed+1) * 16
+    if (effect = 9) or (effect = 5) or (effect = 4) then pause (espeed+1) * 12
+    RETURN
+
+;Font for ascii characters
+    textfont:
+    lookup outval,[236,241,156,241,156,140,188,108,145,120,12,28,110,110,252,204,252,204,180,129,124,12,108,2,2,144], outa2h 
+    lookup outval,[68,80,0,16,68,4,64,68,16,0,164,0,128,32,0,68,32,100,68,16,0,136,40,168,136,136], outi2n 
+    goto   remap
+
+; OTHER NUMERIC FONTS 
+    font0: ;seven seg
+    lookup outval,[252,96,216,240,100,180,188,224,252,228], OUTA2H 
+    lookup outval,[136,0,68,68,68,68,68,0,68,68], OUTI2N
+    goto   remap
+    
+    font1: ; burroughs
+    lookup outval,[252,1,208,176,4,148,188,128,30,228], OUTA2H 
+    lookup outval,[136,16,72,192,140,36,68,144,36,68], OUTI2N
+    goto    remap
+    
+    font2: ;angular
+    lookup outval,[112,0,144,144,4,146,16,128,146,130], OUTA2H 
+    lookup outval,[136,136,136,160,140,32,168,136,168,136], OUTI2N
+    goto   remap
+    
+    font3: ;formal
+    lookup outval,[30,96,152,144,4,178,48,128,180,132], OUTA2H 
+    lookup outval,[32,128,132,164,148,64,200,144,204,148], OUTI2N                                                                                      
+    goto    remap
+    
+    font4: ; chamfer
+    lookup outval,[252,96,216,240,102,182,188,192,254,228], OUTA2H 
+    lookup outval,[168,192,204,224,228,100,108,208,76,164], OUTI2N                                                                                      
+    goto    remap
+    
+    font5: ; secret
+    lookup outval,[252,0,110,253,145,108,108,156,253,157], OUTA2H 
+    lookup outval,[68,68,72,16,20,164,228,0,84,20], OUTI2N                                                                                      
+    goto    remap
+    
+    font6: ; caitlin
+    lookup outval,[252,96,22,146,6,80,140,129,38,22], OUTA2H 
+    lookup outval,[40,160,12,12,84,224,12,144,100,36], OUTI2N                                                                                      
+    goto    remap
+    
+    font7: ; clockalogue
+    lookup outval,[110,15,14,14,14,96,96,96,98,97], OUTA2H 
+    lookup outval,[168,8,136,72,40,176,168,164,160,160], OUTI2N                                                                                      
+    goto    remap
+    
+    font8: ; bargraph
+    lookup outval,[128,192,224,240,248,252,254,255,255,255], OUTA2H 
+    lookup outval,[0,0,0,0,0,0,0,0,128,192], OUTI2N                                                                                      
+    goto    remap
+    
+    fontnixie: ; nixie
+    lookup outval,[128,64,32,16,8,4,2,1,0,0], OUTA2H 
+    lookup outval,[0,0,0,0,0,0,0,0,128,64], OUTI2N                                                                                      
+    goto    remap
+
+;User Fonts are stored in eeprom and are retrieved at runtime    
+    userfont:
+    IF outval >=126 then goto remap
+    ee_adr = outval * 2
+    read    ee_adr,outa2h
+    ee_adr = ee_adr + 1
+    read    ee_adr,outi2n    
+    goto    remap    
+ 
+   
+    
+; = = = = = START OF INTERUPT = = = = = = = 
+; This interupt is in assembly in order that
+; the processing overhead be always controlled
+; and finite. A Picbasic Interupt structure
+; seemed to execute for varying durations,
+; but I suppose had I of spent as much time using
+; PBasic interupts I could have got the same result    
+ASM
+myint
+        btfss   INTCON,6  ; Is this interupt caused by some PIE1 device
+        goto    dot
+        btfss   PIR1,5    ; is the received data flag set ?
+        goto    dot
+        movf    RCREG,w
+        movwf   _RX_BUF  ; save the received byte immediately
+        movwf   TXREG    ; Load the TX register immediately to pass the byte on
+        nop
+        btfss   PIR1,TXIF  ; Wait for TX send to complte
+        goto    $-1
+
+;progrss register bits 0-3 get set as each element of the header
+; is received. If a bad byte is detected then progress is reset
+; and the code starts waiting for another $ sign
+
+        
+prog0   btfsc   _PROGRESS,0  ; has  the progress,0 step been completed
+        goto    prog1        ; yes, test for progress,1
+        bsf     _PROGRESS,0  ; no, set this bit now
+        movf    _RX_BUF,w
+        xorlw   '$'          ; test if this byte is a $ sign
+        btfss   STATUS,Z
+        goto    dump         ; not a $ sign, clear the progress register
+        goto    out          ; is a $ sign, don't clear progress, allow more
+        
+prog1   btfsc   _PROGRESS,1 ; same as above, validate the received data/header
+        goto    prog2
+        bsf     _PROGRESS,1
+        movf    _RX_BUF,w
+        xorlw   'B'
+        btfss   STATUS,Z
+        goto    dump   
+        goto    out
+prog2   btfsc   _PROGRESS,2
+        goto    prog3
+        bsf     _PROGRESS,2
+        movf    _RX_BUF,w
+        xorlw   '7'
+        btfss   STATUS,Z
+        goto    dump  
+        goto    out
+prog3   btfsc   _PROGRESS,3
+        goto    prog4
+        bsf     _PROGRESS,3
+        clrf    _RX_BYTE_CNT
+        
+; The fourth byte to be received is the 'type of message' character
+; as for prog0 to prog2, if the fourth byte doesn't meet the test
+; criteria of being a valid message type this data sentence is aborted        
+        
+        movf    _RX_BUF,w
+        movwf   _SPARE
+        xorlw   'M'
+        btfsc   STATUS,Z
+        goto    type1
+        movf    _SPARE,w
+        xorlw   'F'
+        btfsc   STATUS,Z
+        goto    type3
+        movf    _SPARE,w
+        xorlw   'W'
+        btfsc   STATUS,Z
+        goto    type2
+        movf    _SPARE,w
+        xorlw   'E'
+        btfsc   STATUS,Z
+        goto    type4
+        movf    _SPARE,w
+        xorlw   'S'
+        btfsc   STATUS,Z
+        goto    type5
+        movf    _SPARE,w
+        xorlw   'U'
+        btfsc   STATUS,Z
+        goto    type7       
+        
+        goto    dump ; If we got here then this is not a valid message type
+        
+        
+type1   movlw   1    ; assign the correct message number to the TYPE reg
+        movwf   _TYPE
+        goto    out
+type2   movlw   2
+        movwf   _TYPE
+        goto    out
+type3   movlw   3
+        movwf   _TYPE
+        goto    out
+type4   movlw   4
+        movwf   _TYPE
+        goto    out
+type5   movlw   5
+        movwf   _TYPE
+        goto    out
+type7   movlw   7
+        movwf   _TYPE
+        goto    out      
+
+        
+  
+; If we got to here then the message type is valid and all that's required
+; is to pick the correct data byte from the stream relevant to this device's
+; enumerated position in the chain, and then save it for processing
+prog4   ;duntype
+
+
+        movf   _RX_BUF,w
+        xorlw   13          ; Is this the final character of a message ?
+        btfsc   STATUS,Z 
+        goto    goodmes
+        
+        
+        ; For message type 2, Write eeprom userfont data.....
+        movf   _TYPE,w
+        xorlw   2
+        btfss   STATUS,Z
+        goto    typnot2
+        movlw   17
+        subwf    _RX_BYTE_CNT,w
+        btfsc   STATUS,C
+        goto    out
+        
+        movlw   _RX_BUFFER
+        addwf   _RX_BYTE_CNT,w
+        movwf   FSR
+        movf    _RX_BUF,w
+        movwf   INDF
+        movf    _RX_BYTE_CNT,w
+        xorlw   255
+        btfss   STATUS,Z
+        incf    _RX_BYTE_CNT,f
+        goto    out
+
+        ; For all other, non- type 2 messages, count data bytes
+        ; and when the current byte number equals this device's
+        ; enumerated position put the current data byte in the buffer , OUTVAL
+typnot2 movf    _RX_BYTE_CNT,w
+        xorlw   255
+        btfss   STATUS,Z
+        incf    _RX_BYTE_CNT,f
+        movf    _RX_BYTE_CNT,w
+        xorwf   _DEVICE,w
+        btfss   STATUS,Z
+        goto    out
+        movf    _RX_BUF,w
+        movwf   _OUTVAL   ; Outval now has the correct data byte with respect
+        goto    out       ; to this device's position in the chain
+        
+        ;got here, is a good message
+
+goodmes movf    _DEVICE,w
+        subwf   _RX_BYTE_CNT,w
+        btfss   STATUS,C
+        goto    dump    ; This ensures we don't try to save the <ENTER> char
+        
+        movf    _OUTVAL,W
+        xorlw   33      ; Character 33 is the exclamation mark
+        btfsc   STATUS,Z; In this application an ' ! ' means ignore this data
+        goto    dump
+       
+       
+        movf    _TYPE,w
+        xorlw   3
+        btfss   STATUS,Z
+        goto    not3
+        
+        ;Type 3 message stuff, Font number
+        movf    _OUTVAL,w        
+        movwf   _FONT   
+        movlw   48      ; Subtract the ascii value 48 to create 0-9
+        subwf   _FONT,1
+        
+        movf    _FONT,w ; store immediately
+        movwf   _EE_DAT
+        movlw   253
+        movwf   _EE_ADR
+        goto    ee_write_no_wait
+        
+          
+        
+not3   
+        movf    _TYPE,w
+        xorlw   4
+        btfss   STATUS,Z
+        goto    not4
+        movf    _OUTVAL,w
+        movwf   _EFFECT   
+        movlw   48
+        subwf   _EFFECT,1
+        movf    _EFFECT,w
+        movwf   _EE_DAT
+        movlw   254
+        movwf   _EE_ADR
+        goto    ee_write_no_wait
+        
+
+
+
+
+
+
+not4    movf    _TYPE,w
+        xorlw   5
+        btfss   STATUS,Z
+        goto    not5
+        movf    _OUTVAL,w
+        movwf   _ESPEED
+        movlw   48
+        subwf   _ESPEED,1
+        movf    _ESPEED,w
+        movwf   _EE_DAT
+        movlw   255
+        movwf   _EE_ADR
+        goto    ee_write_no_wait
+
+
+; Normally, this procedure could cause hangups, where the data is
+; coming in faster than it takes an EEPROM byte to be written.
+; But because the speed is only 9600 baud it is possible to drop
+;the data to be written to eeprom into the write buffer and not have
+; to wait for completion, which would probably cause a display aberation
+; as the code execution waits for eeprom writing to complete, because
+; we are still in the interupt here.
+
+ee_write_no_wait
+    bcf     STATUS,RP0
+    bcf     STATUS,RP1
+    bcf     PIR2,EEIF
+    movf    _EE_ADR,w
+    bsf     STATUS,RP1
+    movwf   EEADR
+    bcf     STATUS,RP1
+    movf    _EE_DAT,w
+    bsf     STATUS,RP1
+    movwf   10Ch   ;_EEDAT
+    bsf     STATUS,RP0
+    bcf     EECON1,EEPGD
+	BSF 	EECON1, WREN
+	MOVLW 	055h
+	MOVWF 	EECON2
+	MOVLW 	0AAh
+	MOVWF 	EECON2
+	BSF 	EECON1, WR
+	NOP
+    bcf     STATUS,RP0
+    bcf     STATUS,RP1
+    goto    dump
+
+
+
+not5    movf    _TYPE,w
+        xorlw   7 
+        btfss   STATUS,Z
+        goto    not7
+        movf    _OUTVAL,w
+        xorlw   48
+        btfsc   STATUS,Z
+        bcf     _ZFLAGS,7
+        
+        movf    _OUTVAL,w
+        xorlw   49
+        btfsc   STATUS,Z
+        bsf     _ZFLAGS,7
+        goto    dump
+              
+
+not7  
+        bsf     _CONTROL,1
+        goto    out
+
+; Jumps to 'DUMP' are made when data cannot be validated
+; It prevents the code from looping endlessly waiting for a good
+; byte, helping to free it up from processing line noise and
+; clears all progress counters at once in case the next data byte
+; is the start of some good data
+        
+dump    clrf    _RX_BYTE_CNT
+        clrf    _TYPE
+        clrf    _PROGRESS
+        bcf     _CONTROL,1
+        goto    out       
+        
+        
+dot btfss   INTCON,2  ;Did a timer overflow occur ?
+    goto    OUT
+    bcf     INTCON,2  ; do timer maintenance
+    decfsz  _TICKS
+    goto     out
+    bsf     _CONTROL,0
+    movf    _TICKS_RELOAD,w
+    movwf   _TICKS
+out                  ; restore W, Status and Pclath
+    movf psave, W
+    movwf PCLATH
+    swapf ssave, W
+    movwf STATUS
+    swapf wsave, F
+    swapf wsave, W
+    retfie
+endasm
+
+INIT:   ; Initialaisation
+; +*+*+ SPECIAL FUNCTION REGISTERS +*+*+*+
+
+ADCON1 = %10000111 ' Configure A/D for Digital
+TRISA = %000000 ' Set port i/o direction pins
+TRISB = %00100000
+TRISC = %00000000
+PORTA = %00000000  ' clear i/o port status
+PORTB = %00000000
+PORTC = %00000000
+INTCON = %00000000
+PIE1 = %00000000
+OPTION_REG = %10000111
+SSPCON = %00000000
+SSPSTAT = 0
+ANSEL = 0
+ANSELH = 0
+BAUDCTL = %00000000
+
+
+
+
+
+
+CONTINIT:
+OSCTUNE = %00000000
+SPBRG = 24 ; provides baudrate = 9600, adjust between 23-25 if your
+            ;16F690 runs out of the normal sped range on internal osc
+OSCCON = %01100001  ; set OSC = 4MHz
+TXSTA = %10100100
+RCSTA = %10010000
+TICKS_RELOAD = 24
+TICKS = TICKS_RELOAD
+RX_BYTE_CNT = 0
+byte_cnt = 0
+dummy = 1
+ZFLAGS = 0
+outval = " "
+control = 0 
+type = 0    
+new_porta = 0                                        
+new_portb = 0               
+outa2h = 0
+outi2n = 0
+
+font = 0
+effect = 1  
+espeed = 3
+
+
+; = = = = = = START OF AUTO-ENUMERATION ROUTINE = = = = = = =
+   
+asm
+    btfss   PIR1,TXIF
+    goto    $-1
+    movlw   171
+    movwf   TXREG  ; SEND '171', which wakes up potentially sleepy USARTS
+    nop
+    btfss   PIR1,TXIF
+    goto    $-1
+endasm
+
+
+
+;Investigate own position in the chain...
+   pause 1
+asm
+    ; Clear RX register
+    bcf     RCSTA,4
+    movf    RCREG,w
+    movf    RCREG,w
+    movf    RCREG,w    ; RX register is 3-deep
+    bsf     RCSTA,4
+    nop
+    nop
+    movlw   171
+    movwf   TXREG     ; Now send the identifying value of '171'
+    nop
+    btfss   PIR1,TXIF ; Wait till end of transmission
+    goto    $-1
+endasm
+    pause 5    ; Value of 5 works well, you could change it if problems  occur
+                ; during this process. If it's too long data errors will happen
+asm
+    movf    RCREG,w
+    xorlw   171       ; Does the RX RCREG contain 171 ?
+    btfsc   STATUS,Z
+    goto    _NOTFIRST ; Yes, so it's not the first device, goto notfirst
+
+    movlw   1
+    movwf   _DEVICE     ;Assign '1' to this device and transmit it
+    movwf   _OUTVAL
+
+    movwf   TXREG
+    nop
+    btfss   PIR1,TXIF  ; Once transmitted go to the main loop
+    goto    $-1
+    goto    _MAIN
+
+endasm
+
+NOTFIRST:   ;So this device is not the first
+            ; All it does now is wait for a byte to be received
+            ; increments that value, and retransmits it
+
+asm
+    btfss   PIR1,5
+    goto    $-1
+    movf    RCREG,w
+    addlw   1
+    movwf   _DEVICE
+    movwf   TXREG
+    nop
+    btfss   PIR1,TXIF
+    goto    $-1   
+endasm
+goto    main    ; Goes to the main routine
+
+
+
+; Registers OUTa2h and OUTi2n are buffers for the segment outputs
+; In the following procedure the relevant bits are remapped to 
+; their coresponding port bit buffers. the port bits themselves are not 
+; changed during this procedure.
+remap:
+asm
+    btfsc   _OUTA2H,7        ;seg1
+    bsf     _NEW_PORTA,1
+    btfss   _OUTA2H,7
+    bcf     _NEW_PORTA,1
+    
+    btfsc   _OUTA2H,6     ;seg2
+    bsf     _NEW_PORTC,0
+    btfss   _OUTA2H,6
+    bcf     _NEW_PORTC,0
+    
+    btfsc   _OUTA2H,5
+    bsf     _NEW_PORTA,2
+    btfss   _OUTA2H,5
+    bcf     _NEW_PORTA,2
+
+    btfsc   _OUTA2H,4   ;seg4
+    bsf     _NEW_PORTA,5
+    btfss   _OUTA2H,4
+    bcf     _NEW_PORTA,5
+
+    btfsc   _OUTA2H,3    ;seg5
+    bsf     _NEW_PORTC,4
+    btfss   _OUTA2H,3
+    bcf     _NEW_PORTC,4
+
+    btfsc   _OUTA2H,2
+    bsf     _NEW_PORTC,3
+    btfss   _OUTA2H,2
+    bcf     _NEW_PORTC,3
+
+    btfsc   _OUTA2H,1     ;seg7
+    bsf     _NEW_PORTC,6
+    btfss   _OUTA2H,1
+    bcf     _NEW_PORTC,6
+    
+    btfsc   _OUTA2H,0
+    bsf     _NEW_PORTB,6
+    btfss   _OUTA2H,0
+    bcf     _NEW_PORTB,6
+    
+    btfsc   _OUTI2N,7      ;seg9
+    bsf     _NEW_PORTC,1
+    btfss   _OUTI2N,7
+    bcf     _NEW_PORTC,1
+    
+    btfsc   _OUTI2N,6      ;seg10
+    bsf     _NEW_PORTA,0
+    btfss   _OUTI2N,6
+    bcf     _NEW_PORTA,0
+
+    btfsc   _OUTI2N,5       ;seg11
+    bsf     _NEW_PORTC,2
+    btfss   _OUTI2N,5
+    bcf     _NEW_PORTC,2
+
+    btfsc   _OUTI2N,4       ;seg12
+    bsf     _NEW_PORTC,5
+    btfss   _OUTI2N,4
+    bcf     _NEW_PORTC,5
+
+    btfsc   _OUTI2N,3       ;seg13
+    bsf     _NEW_PORTC,7
+    btfss   _OUTI2N,3
+    bcf     _NEW_PORTC,7
+
+    btfsc   _OUTI2N,2       ;seg14
+    bsf     _NEW_PORTA,4
+    btfss   _OUTI2N,2
+    bcf     _NEW_PORTA,4
+
+    btfsc   _OUTI2N,1
+    bsf     _NEW_PORTB,4    ;underscore from character
+    btfss   _OUTI2N,1
+    bcf     _NEW_PORTB,4
+    
+    btfsc   _ZFLAGS,7        ;underscore from command
+    bsf     _NEW_PORTB,4
+ endasm
+ goto   gotfont ; Now select the effect procedure to be run, based
+                ; on the value in the effect register
+ 
+ GETINPUT:     ; This procedure has shrunk from it's intial proportion
+ progress = 0  ; it merely sets/clears a few bits 
+ low control.1
+ if type <> 0  then goto goodtype
+ rx_byte_cnt = 0
+ type = 0
+ return
+ 
+ 
+ goodtype:  ;This piece of code subtracts ascii 48 from the received byte
+  ticks = ticks_reload
+  if type = 2 then  type2: 
+  type1:   
+  type = 0
+  if font <> ("U"-48) THEN  ; do not -48 if userfont is selected
+    if 47 < outval and outval < 58 then outval = outval - 48
+  ENDIF
+  high control.7
+  return                                                                                                         
+  
+
+  
+  type2: ; write eeprom font
+  if font <> ("U"-48) THEN RETURN
+  
+  type = 0
+  IF  rx_buffer(0) >= 126 then RETURN
+  EE_ADR = RX_BUFFER(0) * 2
+  
+  ee_dat = 0
+  if rx_buffer (1) = "1" then high ee_dat.7 
+  if rx_buffer (2) = "1" then high ee_dat.6
+  if rx_buffer (3) = "1" then high ee_dat.5
+  if rx_buffer (4) = "1" then high ee_dat.4
+  if rx_buffer (5) = "1" then high ee_dat.3 
+  if rx_buffer (6) = "1" then high ee_dat.2
+  if rx_buffer (7) = "1" then high ee_dat.1
+  if rx_buffer (8) = "1" then high ee_dat.0
+  
+  write ee_adr,ee_dat
+  ee_adr = ee_adr + 1
+  ee_dat = 0
+  if rx_buffer (9) = "1" then high ee_dat.7 
+  if rx_buffer (10) = "1" then high ee_dat.6
+  if rx_buffer (11) = "1" then high ee_dat.5
+  if rx_buffer (12) = "1" then high ee_dat.4
+  if rx_buffer (13) = "1" then high ee_dat.3 
+  if rx_buffer (14) = "1" then high ee_dat.2
+  if rx_buffer (15) = "1" then high ee_dat.1
+  if rx_buffer (16) = "1" then high ee_dat.0
+  
+  write ee_adr,ee_dat
+  return
+
+
+;Program Start
+MAIN:  ; 
+    read    253, font
+    read    254, effect
+    read    255, espeed
+
+INTCON = %11100000  ;enable RX interupts
+PIE1 = %00100000                  
+
+
+                                                                                                                 
+TOP:  ; = = = T H E  M A I N   L O O P = = = = = =
+
+    if control.0 then low  CONTROL.0;      low control.0
+    if control.1    then    gosub   GETINPUT
+    if control.7 then gosub CHANGEDISP
+ goto  TOP
+ 
+
+;Once it has been established that new data has arrived for display
+; control register bit 7  is set
+CHANGEDISP:
+    low     control.7 ; clear bit 7 first
+ 
+    ; Outval is the character or number stored when the data string was being
+    ; received.
+    ; it is used as a pointer in the font lookups
+    ; FONTS are selected depending on the value of 'FONT'
+    ; The bit pattern is loaded into two registers OUTA2H
+    ; and OUTI2N. They are  then decoded and the new
+    ; port output registers are loaded with the correct
+    ; bit pattern, before returning to ' gotfont' , below
+;    if font = 0 then goto font0
+
+    ;To allow selective display editing, where maybe
+    ;only one character needs to be changed, a ! exclamation
+    ;mark  ascii, dec.33, (hex.21)indicates 'no further action'
+
+    if  0 <= outval and outval < 10 then goto numeric
+
+    if font = ("U"-48)  then goto userfont
+
+    
+    if  64 < outval and outval < 91 then
+        outval = outval - 65
+        goto    textfont
+    endif 
+    if outval = 32  then
+        outa2h = 0
+        outi2n = 0
+        goto    remap
+    endif   
+    
+    goto norm
+    numeric:
+        
+; Font selection
+
+    select case font
+    case 0
+        goto    font0
+    case 1
+        goto    font1
+    case 2
+        goto   font2
+    case 3
+        goto   font3
+    case    4
+        goto    font4
+    case 5
+        goto    font5
+    case    6    
+        goto    font6
+    case 7
+        goto    font7
+    case 8
+        goto    font8
+    CASE 9
+        goto    fontnixie
+    end select
+    goto    font0
+gotfont:;   move on to implementing the chosen effect
+
+    ; At this point old_port has the previous pattern
+    ; and new_port has the new one
+    ; Now select the effect required and perform it.
+    ; Effects are 'norm' where the display changes 
+    ; instantaneously, 'fade' for low side blending,
+    ; 'swell' for high side blending and 'spiral',                        
+    ; which removes/replaces bits in the orde a-n
+;    if effect = 0 then goto norm
+BRANCHL effect,[norm,fade1,fade1,sweller,zipper,shifter,bits,spiral,spiral,wiper]
+goto    norm
+
+ 
+ 
+ 
+
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTC,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character  
+spiral:
+    
+    HIGH    segi
+    HIGH    segm
+    LOW     segh
+    LOW     segl
+    low     sega
+    low     segd
+    low     segu
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segj
+    HIGH    segn
+    LOW     segi
+    LOW     segm
+    LOW     segb
+    LOW     sege
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segk
+    HIGH    segg
+    LOW     segj
+    LOW     segn
+    low     segc
+    low     segf
+    gosub   spiralpause
+    
+    high    segl
+    high    segh
+    low     segk
+    low     segg
+    gosub   spiralpause
+if effect <> 8 then goto spircont    
+    HIGH    segi
+    HIGH    segm
+    LOW     segh
+    LOW     segl
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segj
+    HIGH    segn
+    LOW     segi
+    LOW     segm
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segk
+    HIGH    segg
+    LOW     segj
+    LOW     segn
+    gosub   spiralpause
+    
+    high    segl
+    high    segh
+    low     segk
+    low     segg
+    gosub   spiralpause
+    
+    
+    
+ 
+    
+spircont:    
+    high    segi
+    high    segm
+    if  not outi2n.4 then
+       low     segl  
+    endif
+    if  not outa2h.0 then
+       low     segh  
+    endif
+    gosub   spiralpause
+    
+    HIGH    segj
+    HIGH    segn
+    if  not outi2n.7 then
+       LOW     segi  
+    endif
+    if  not outi2n.3 then
+       LOW     segm  
+    endif
+    if  outa2h.6    then
+        high    segb  
+    endif
+    if  outa2h.3    then
+        high    sege  
+    endif
+    gosub   spiralpause
+    
+    HIGH    segk
+    HIGH    segg
+    if  not outi2n.6 then
+        LOW     segj
+    endif
+    if  not outi2n.2 then
+        LOW     segn
+    endif
+    if  outa2h.5    then
+        high    segc
+    endif
+    if  outa2h.2    then
+        high    segf
+    endif
+    
+    gosub   spiralpause
+    if  not outi2n.5    then
+        low segk
+    endif
+    if  not outa2h.1    then
+        low segg
+    endif
+    if  outa2h.7    then
+        high    sega
+    endif
+    if  outa2h.4    then
+        high    segd
+    endif
+    if ZFLAGS.7 then    high    segu
+    goto    outdisp
+
+
+
+; no effect, or effect = 0
+; the new port values are just latched directly into the ports
+ norm:
+    PORTC = NEW_PORTC
+    PORTB = NEW_PORTB
+    PORTA = NEW_PORTA
+    goto     outdisp
+
+
+    ; for the effects, the effects byte is split into two halves
+    
+    ; where 7 6 5 4 3 2 1 0 are the 8 bits the are coded as follows
+    ; bits 7-4 = 'incoming' effect, bits 3-0 = 'outgoing' effect
+    ; The highest bit of each 4 bit nibble denotes the speed of 
+    ; the effect 0 = fast, 1 = slow. The lower three bits are the 
+    ; effect number, 1 = fade, 2 = swell, 3 = spiral
+     
+  
+fade1:
+    Bespeed = espeed + 1
+    GP = 0
+    GP3 = Bespeed * 25
+    if effect = 2 then gp3 = bespeed * 21
+    for GP = 0 to GP3
+        GP2 = 0
+        for GP2 = 0 to 8;((espeed + 1) * 10) 
+            PORTA = New_porta
+            PORTB = new_portb
+            PORTC = NEW_portc
+asm 
+            movf   _EFFECT,w
+            xorlw   2
+            btfss   STATUS,z
+            goto    $+4
+            movf    _GP3,w
+            movwf   _GP4
+            goto    $+4
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTA = old_porta
+            PORTB = old_portb
+            PORTC = old_portc
+
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+        next GP2
+    next gp  
+    PORTA = New_porta
+    PORTB = new_portb
+    PORTC = NEW_portc
+
+    goto    outdisp
+ 
+  
+      
+    
+sweller:
+     Bespeed = espeed + 1
+    GP = 0
+    GP3 = Bespeed * 25
+    if effect = 4 then gp3 = bespeed*15
+    for GP = 0 to GP3
+        GP2 = 0
+        for GP2 = 0 to 9
+            PORTA = %11111111
+            PORTB = %11101111
+            PORTC = %11111111
+asm 
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTA = old_porta
+            PORTB = old_portb
+            PORTC = old_portc
+
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+        next GP2
+    next gp 
+if effect = 5 then goto endswell   
+    GP = 0
+    GP3 = Bespeed * 25
+    for GP = 0 to GP3
+        GP2 = 0
+        for GP2 = 0 to 6;((espeed + 1) * 10) 
+            PORTA = NEW_PORTA
+            PORTB = new_portb
+            PORTC = new_portc
+asm 
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTA = %11111111
+            PORTB = %11101111
+            PORTC = %11111111
+
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+        next GP2
+    next gp 
+
+endswell:    
+    PORTA = New_porta
+    PORTB = new_portb
+    PORTC = NEW_portc
+goto    outdisp
+    
+
+outdisp:
+    old_porta = new_PORTA
+    old_portb = new_PORTB
+    old_portc = new_PORTC     
+return
+ 
+ 
+  fouta:
+  old_PORTA = porta
+
+    Bespeed = espeed + 1
+    GP = 0
+    GP3 = Bespeed * 25
+    for GP = 0 to GP3
+            PORTA = temp1
+asm 
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTA = old_porta
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+       
+    next gp  
+    PORTA = temp1
+   return
+
+  foutb:
+    old_PORTB = portb
+
+    Bespeed = espeed + 1
+    GP = 0
+    GP3 = Bespeed * 25
+    for GP = 0 to GP3
+       
+asm 
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTB = old_portB
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+       
+    next gp  
+    PORTB = temp1
+  
+    return 
+    
+  foutc:
+    old_PORTC = portC
+
+    Bespeed = espeed + 1
+    GP = 0
+    GP3 = Bespeed * 25
+    for GP = 0 to GP3
+            PORTC = temp1
+asm 
+            movf    _GP,w
+            addlw   1
+            movwf   _GP4
+            decfsz   _GP4
+            goto    $-1
+endasm
+            PORTC = old_portC
+ASM         movf    _GP,w
+            subwf   _GP3,0
+            addlw   1
+            movwf   _GP4
+            decfsz  _GP4
+            goto    $-1
+ENDASM 
+       
+    next gp  
+    PORTC = temp1
+  
+    return   
+        
+
+wiper:
+   
+    
+    HIGH    segi
+    LOW     sega
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segj
+    LOW     segi
+    LOW     segb
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segk
+    LOW     segj
+    low     segc
+    gosub   spiralpause
+    
+    high    segl
+    low     segk
+    gosub   spiralpause
+    
+    high    segm
+    low     segl
+    low     segd
+    low     segu
+    gosub   spiralpause
+    
+    high    segn
+    low     segm
+    low     sege
+    gosub   spiralpause
+    
+    high    segg
+    low     segn
+    low     segf
+    gosub   spiralpause
+    
+    high    segh
+    low     segg
+    gosub   spiralpause
+    
+    
+    HIGH    segi
+    if  not outa2h.0    then    low     segh
+    if  outa2h.7    then    high    sega
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segj
+    if  not outi2n.7 then LOW     segi
+    if  outa2h.6 then   high    segb
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segk
+    if  not outi2n.6    then    LOW     segj
+    if  outa2h.5    then    high     segc
+    gosub   spiralpause
+    
+    high    segl
+    if  not outi2n.5    then    low     segk
+    gosub   spiralpause
+    
+    high    segm
+    if  not outi2n.4    then    low     segl
+    if  outa2h.4    then    high     segd
+    if  ZFLAGS.7    then    high    segu
+    gosub   spiralpause
+    
+    high    segn
+    if  not outi2n.3    then    low     segm
+    if  outa2h.3    then    high     sege
+    gosub   spiralpause
+    
+    high    segg
+    if  not outi2n.2    then    low     segn
+    if  outa2h.2    then    high     segf
+    gosub   spiralpause
+    
+    if  outa2h.0    then    high    segh
+    if  not outa2h.1    then    low     segg
+    gosub   spiralpause
+
+    goto    outdisp
+
+
+
+
+    
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTC,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character
+
+bits:
+
+b1: 
+   if not sega then goto b2 
+   temp1 = PORTa - 2  
+    gosub   fouta
+b2: 
+    if not segc then goto b3
+    temp1 = porta - 4
+    gosub   fouta
+b3:
+    if not segk then goto b4
+    temp1 = portc - 4
+    gosub   foutc
+ 
+b4: 
+   if not   segn then goto b5 
+   temp1 = PORTa - 16  
+    gosub   fouta
+b5: 
+    if not segh then goto b6
+    temp1 = portb - 64
+    gosub   foutb
+b6:
+    if not segl then goto b7
+    temp1 = portc - 32
+    gosub   foutc
+b7: 
+   if not segf then goto b8 
+   temp1 = PORTc - 8  
+    gosub   foutc
+b8: 
+    if not segj then goto b9
+    temp1 = porta - 1
+    gosub   fouta
+b9:
+    if not segd then goto b10
+    temp1 = porta - 32
+    gosub   fouta
+b10: 
+   if not segb then goto b11 
+   temp1 = PORTc - 1  
+    gosub   foutc
+b11: 
+    if not segm then goto b12
+    temp1 = portc - 128
+    gosub   foutc
+b12:
+    if not segg then goto b13
+    temp1 = portc - 16
+    gosub   foutc
+b13: 
+   if not segi then goto b14 
+   temp1 = PORTc - 2  
+    gosub   foutc
+
+b14: 
+    if not sege then goto b15
+    temp1 = portc - 64
+    gosub   foutc
+
+b15:
+    if not segu then goto b16
+    temp1 = portb - 16
+    gosub   foutb                                         
+              
+    
+b16:
+
+
+    goto    nb1
+
+
+ 
+nb1: 
+   if not new_PORTA.0 then goto nb2 
+   temp1 = porta + 1  
+    gosub   fouta
+nb2: 
+    if not new_PORTA.2 then goto nb3
+    temp1 = porta + 4
+    gosub   fouta
+
+nb3:
+    if not new_PORTC.2 then goto nb4
+    temp1 = portc + 4
+    gosub   foutc
+ 
+ nb4: 
+   if not   new_PORTC.5 then goto nb5 
+   temp1 = PORTC + 32  
+    gosub   foutc
+nb5: 
+    if not new_PORTB.6 then goto nb6
+    temp1 = portb + 64
+    gosub   foutb
+nb6:
+    if not new_PORTA.4 then goto nb7
+    temp1 = porta + 16
+    gosub   fouta
+nb7: 
+   if not new_PORTC.3 then goto nb8 
+   temp1 = portc + 8  
+    gosub   foutc
+nb8: 
+    if not new_PORTA.1 then goto nb9
+    temp1 = porta + 2
+    gosub   fouta
+nb9:
+    if not new_PORTA.5 then goto nb10
+    temp1 = porta + 32
+    gosub   fouta
+nb10: 
+   if not new_PORTC.0 then goto nb11 
+   temp1 = PORTc + 1  
+    gosub   foutc
+nb11: 
+    if not new_PORTC.7 then goto nb12
+    temp1 = portc + 128
+    gosub   foutc
+nb12:
+    if not new_PORTC.6 then goto nb13
+    temp1 = portc + 64
+    gosub   foutc
+nb13: 
+   if not new_PORTC.1 then goto nb14 
+   temp1 = PORTc + 2  
+    gosub   foutc
+nb14: 
+    if not new_PORTC.4 then goto nb15
+    temp1 = portc + 16
+    gosub   foutc
+nb15:
+    if not new_PORTB.4 then goto nb16
+    temp1 = portb + 16
+    gosub   foutb             
+    
+nb16:
+    goto    outdisp
+    
+zipper:
+    HIGH    segh
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segg
+    high    segi
+    LOW     segh
+    low     sega
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segn
+    high    segj
+    LOW     segi
+    low     segg
+    low     segb
+    low     segf
+    gosub   spiralpause
+    
+    high    segk
+    high    segm
+    low     segn
+    low     segj
+    low     sege
+    low     segc
+    gosub   spiralpause
+    
+    high    segl
+    low     segm
+    low     segk
+    low     segd
+    gosub   spiralpause
+    
+    low     segl
+    low     segu
+    gosub   spiralpause
+    
+
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTC,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character
+
+    
+    HIGH    segl
+    GOSUB   SPIRALPAUSE
+    if      zflags.7    then    high    segu
+    
+    HIGH    segd
+    high    segk
+    high    segm
+    if  not outi2n.4 then LOW     segl
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segn
+    high    segj
+    high    segc
+    high    sege
+    if  not outi2n.5    then    LOW     segk
+    if  not outi2n.3    then    low     segm
+    if  not outa2h.4    then    low     segd
+    gosub   spiralpause
+    
+    
+    high    segg
+    high    segi
+    high    segb
+    high    segf
+    if  not outi2n.2    then    low     segn
+    if  not outi2n.6    then    low     segj
+    if  not outa2h.5    then    low     segc
+    if  not OUTA2H.3    then    low     sege
+    gosub   spiralpause
+    
+    
+    
+    
+    
+    
+    high    sega
+    if  not outA2H.6    then    low     segb
+    if  not outa2h.2    then    low     segf
+    
+    
+    gosub   spiralpause
+    
+    high    segh
+    if  not outi2n.7    then    low     segi
+    if  not outa2h.1    then    low     segg
+    if  not outa2h.7    then    LOW     sega
+    gosub   spiralpause
+    
+    if  not outa2h.0    then    low     segh
+    gosub   spiralpause
+    
+
+    goto    outdisp
+
+
+
+
+
+shifter:
+    HIGH    segn
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segm
+    high    segg
+    LOW     segn
+    low     segf
+    low     sege
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segh
+    high    segl
+    LOW     segm
+    low     segg
+    gosub   spiralpause
+    
+    high    segk
+    high    segi
+    low     segh
+    low     segl
+    low     sega
+    low     segd
+    low     segu
+    gosub   spiralpause
+    
+    high    segj
+    low     segi
+    low     segk
+    low     segb
+    low     segc
+    gosub   spiralpause
+    
+    low     segj
+    gosub   spiralpause
+    
+
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTC,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character
+
+    
+    HIGH    segn
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    sege
+    high    segf
+    high    segm
+    high    segg
+    if  not outi2n.2 then LOW     segn
+    GOSUB   SPIRALPAUSE
+    
+    HIGH    segh
+    high    segl
+    if      zflags.7    then    high    segu
+    if  not outi2n.3    then    LOW     segm
+    if  not outa2h.1    then    low     segg
+    if  not outa2h.3    then    low     sege
+    if  not outa2h.2    then    low     segf
+    gosub   spiralpause
+
+    high    segk
+    high    segi
+    if  not outa2h.0    then    low     segh
+    if  not outi2n.4    then    low     segl
+    if  outa2h.7    then    high     sega
+    if  outa2h.4    then    high     segd
+    gosub   spiralpause
+    
+    high    segj
+    if  outA2H.6    then    high     segb
+    if  outa2h.5    then    high     segc
+    if  not outi2n.7    then    low     segi
+    if  not outi2n.5    then    low     segk
+    gosub   spiralpause
+    
+    if  not outi2n.6    then    low     segj
+    gosub   spiralpause
+    
+
+
+
+
+
+
+    goto    outdisp
+
+
+
+
+
+    
+'a    bsf     _NEW_PORTA,1
+'b    bsf     _NEW_PORTC,0
+'c    bsf     _NEW_PORTA,2
+'d    bsf     _NEW_PORTA,5
+'e    bsf     _NEW_PORTC,6
+'f    bsf     _NEW_PORTC,3
+'g    bsf     _NEW_PORTC,4
+'h    bsf     _NEW_PORTB,6
+'i    bsf     _NEW_PORTC,1
+'j    bsf     _NEW_PORTA,0
+'k    bsf     _NEW_PORTC,2
+'l    bsf     _NEW_PORTA,5
+'m    bsf     _NEW_PORTC,7
+'n    bsf     _NEW_PORTA,4
+'u    bsf     _NEW_PORTB,4    ;underscore from character
+
+END
+
