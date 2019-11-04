@@ -1,5 +1,5 @@
 # Smartsockets
-File repository for the Smartsockets Yahoo group.
+File repository for the Smartsockets Yahoo group. (Use the button marked "Branch:master" to access files)
 
 Smartsockets are versatile device specific controllers which are designed to make implementations of multiple element visual displays simple to create.
 *A new version of smartsockets, generic smartsockets, is available to enable the creation of a 4 digit multiplexed display using any suitable display type....LED,VFD,Neon, ? ...* (Please see the files section)
